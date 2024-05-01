@@ -944,6 +944,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cosmic-client-toolkit",
  "current_locale",
  "freedesktop-desktop-entry",
  "freedesktop-icons",
@@ -958,6 +959,7 @@ dependencies = [
  "notify",
  "once_cell",
  "pretty_env_logger",
+ "rand",
  "ron",
  "rust-embed",
  "serde",

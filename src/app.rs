@@ -1,5 +1,8 @@
 use std::fmt::Debug;
+use std::time::Duration;
 
+use cctk::sctk::reexports::calloop::channel::Sender;
+use cctk::wayland_client::protocol::wl_seat::WlSeat;
 use clap::Parser;
 use cosmic::app::{
     Command, Core, CosmicFlags, DbusActivationDetails, DbusActivationMessage, Settings,
@@ -21,7 +24,7 @@ use cosmic::iced::{Color, Limits, Subscription};
 use cosmic::iced_core::alignment::Vertical;
 use cosmic::iced_core::keyboard::key::Named;
 use cosmic::iced_core::keyboard::Key;
-use cosmic::iced_core::{Border, Padding, Rectangle, Shadow};
+use cosmic::iced_core::{event, Border, Padding, Rectangle, Shadow};
 use cosmic::iced_runtime::core::event::wayland::LayerEvent;
 use cosmic::iced_runtime::core::event::{wayland, PlatformSpecific};
 use cosmic::iced_runtime::core::window::Id as SurfaceId;
@@ -37,16 +40,20 @@ use cosmic::widget::button::StyleSheet as ButtonStyleSheet;
 use cosmic::widget::icon::from_name;
 use cosmic::widget::{button, icon, search_input, text_input, tooltip, Column};
 use cosmic::{cctk::sctk, iced, Element, Theme};
+use futures::future::pending;
 use itertools::Itertools;
 use log::error;
 use once_cell::sync::Lazy;
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 use std::sync::Arc;
 use switcheroo_control::Gpu;
 
 use crate::app_group::AppLibraryConfig;
 use crate::fl;
 use crate::subscriptions::desktop_files::desktop_files;
+use crate::subscriptions::wayland_subscription::{wayland_subscription, WaylandRequest, WaylandUpdate};
 use crate::widgets::application::ApplicationButton;
 use crate::widgets::group::GroupButton;
 
@@ -118,6 +125,9 @@ struct CosmicAppLibrary {
     helper: Option<Config>,
     config: AppLibraryConfig,
     cur_group: usize,
+    wayland_sender: Option<Sender<WaylandRequest>>,
+    subscription_ctr: u32,
+    seat: Option<WlSeat>,
     active_surface: bool,
     locale: Option<String>,
     edit_name: Option<String>,
@@ -183,6 +193,10 @@ enum Message {
     InputChanged(String),
     Layer(LayerEvent, SurfaceId),
     Hide,
+    IncrementSubscriptionCtr,
+    Wayland(WaylandUpdate),
+    NewSeat(WlSeat),
+    RemovedSeat(WlSeat),
     ActivateApp(usize, Option<usize>),
     ActivationToken(Option<String>, String, Option<usize>),
     SelectGroup(usize),
@@ -316,6 +330,63 @@ impl cosmic::Application for CosmicAppLibrary {
 
     fn update(&mut self, message: Message) -> Command<Self::Message> {
         match message {
+            Message::IncrementSubscriptionCtr => {
+                self.subscription_ctr += 1;
+            },
+            Message::Wayland(event) => {
+                match event {
+                    WaylandUpdate::Init(tx) => {
+                        self.wayland_sender.replace(tx);
+                    }
+                    WaylandUpdate::Finished => {
+                        let subscription_ctr = self.subscription_ctr;
+                        let mut rng = thread_rng();
+                        let rand_d = rng.gen_range(0..100);
+                        return iced::Command::perform(
+                            async move {
+                                if let Some(millis) = 2u64
+                                    .checked_pow(subscription_ctr)
+                                    .and_then(|d| d.checked_add(rand_d))
+                                {
+                                    sleep(Duration::from_millis(millis)).await;
+                                } else {
+                                    pending::<()>().await;
+                                }
+                            },
+                            |_| Message::IncrementSubscriptionCtr,
+                        )
+                        .map(cosmic::app::message::app);
+                    }
+                    WaylandUpdate::ActivationToken {
+                        token,
+                        exec,
+                        gpu_idx,
+                    } => {
+                        let mut envs = Vec::new();
+                        if let Some(token) = token {
+                            envs.push(("XDG_ACTIVATION_TOKEN".to_string(), token.clone()));
+                            envs.push(("DESKTOP_STARTUP_ID".to_string(), token));
+                        }
+                        if let (Some(gpus), Some(idx)) = (self.gpus.as_ref(), gpu_idx) {
+                            envs.extend(
+                                gpus[idx]
+                                    .environment
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone())),
+                            );
+                        }
+                        tokio::task::spawn_blocking(|| {
+                            cosmic::desktop::spawn_desktop_exec(exec, envs);
+                        });
+                    }
+                }
+            }
+            Message::NewSeat(s) => {
+                self.seat.replace(s);
+            }
+            Message::RemovedSeat(_) => {
+                self.seat.take();
+            }
             Message::InputChanged(value) => {
                 self.search_value = value;
                 return self.filter_apps();
@@ -1170,6 +1241,17 @@ impl cosmic::Application for CosmicAppLibrary {
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch(
             vec![
+                // wayland client subscription
+                wayland_subscription().map(Message::Wayland),
+                listen_with(|e, _| match e {
+                    cosmic::iced_runtime::core::Event::PlatformSpecific(
+                        event::PlatformSpecific::Wayland(event::wayland::Event::Seat(e, seat)),
+                    ) => match e {
+                        event::wayland::SeatEvent::Enter => Some(Message::NewSeat(seat)),
+                        event::wayland::SeatEvent::Leave => Some(Message::RemovedSeat(seat)),
+                    },
+                    _ => None,
+                }),
                 desktop_files(0).map(|_| Message::LoadApps),
                 listen_with(|e, _status| match e {
                     cosmic::iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
